@@ -1,0 +1,15 @@
+# CPU stack for scripts/build_semantic_index.py.
+# Install torch from the CPU wheel index, then the rest:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements-semantic.txt
+torch
+transformers==4.47.1
+timm
+pillow
+numpy
+requests
+rasterio
+scipy
+safetensors
+huggingface_hub
+einops

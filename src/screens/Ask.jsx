@@ -34,6 +34,29 @@ const EXAMPLES = [
   'vehicles near the river crossing',
 ]
 
+export function normQuery(q) {
+  return q.trim().toLowerCase().replace(/\s+/g, ' ')
+}
+
+function ChipFace({ t, className }) {
+  if (t.chip) {
+    return <img src={`./${t.chip}`} alt={t.id} className={`object-cover bg-ink-900 ${className || ''}`} />
+  }
+  return (
+    <SceneChip
+      seed={t.seed}
+      terrain={t.terrain}
+      change={t.render}
+      sensor={t.sensor === 'S1 SAR' ? 'sar' : 'optical'}
+      size={192}
+      lat={t.lat}
+      lon={t.lon}
+      box
+      className={className}
+    />
+  )
+}
+
 const KIND_STYLE = {
   OBJECT: 'border-fg-muted text-fg-hi',
   'SPATIAL RELATION': 'border-sar/60 text-sar',
@@ -94,7 +117,7 @@ export function ResultTile({ t, rank, selected, onSelect, onMore, marking, marke
       className={`relative panel cursor-pointer transition-colors ${selected ? 'border-fg-muted bg-ink-750' : 'hover:border-ink-400'} ${marked ? 'outline outline-1 outline-amber' : ''} ${t.isNew ? 'fade-in' : ''}`}
     >
       <div className="relative">
-        <SceneChip seed={t.seed} terrain={t.terrain} change={t.render} sensor={t.sensor === 'S1 SAR' ? 'sar' : 'optical'} size={192} lat={t.lat} lon={t.lon} box className="aspect-square" />
+        <ChipFace t={t} className="aspect-square w-full" />
         <span className="absolute top-1.5 left-1.5 mono text-2xs px-1 bg-ink-950/85 text-fg-muted">#{rank}</span>
         <span className="absolute top-1.5 right-1.5 mono text-xs px-1.5 bg-ink-950/85 text-fg-hi">{t.score.toFixed(2)}</span>
         {marking && (
@@ -112,7 +135,7 @@ export function ResultTile({ t, rank, selected, onSelect, onMore, marking, marke
           <span className="text-fg-dim">{t.aoi}</span>
         </div>
         <div className="mono text-[10.5px] text-fg-muted truncate">{t.id}</div>
-        {similarMode && (
+        {similarMode && t.context && (
           <div className="pt-1 space-y-1">
             <Meter label="Visual sim." value={t.visual} tone="bg-fg-muted" />
             <Meter label="Context" value={ctxScore(t)} tone="bg-teal" />
@@ -217,8 +240,21 @@ export default function Ask() {
   const [marked, setMarked] = useState([])
   const [probe, setProbe] = useState(null) // { phase: 'train' | 'scan' | 'done', t, scanned }
   const [detectorHits, setDetectorHits] = useState([])
+  const [semIndex, setSemIndex] = useState(null)
+  const [semError, setSemError] = useState(null)
 
   useEffect(() => setAoi(storeAoi), [storeAoi])
+  useEffect(() => {
+    let dead = false
+    fetch('./semantic/index.json')
+      .then((r) => {
+        if (!r.ok) throw new Error(`semantic index ${r.status}`)
+        return r.json()
+      })
+      .then((data) => { if (!dead) setSemIndex(data) })
+      .catch((err) => { if (!dead) setSemError(err.message || 'index unavailable') })
+    return () => { dead = true }
+  }, [])
   useEffect(() => { inputRef.current?.focus() }, [loc.state?.focus])
 
   // Entry from the review queue ("F" = find similar).
@@ -240,15 +276,28 @@ export default function Ask() {
   const infeasible = activeChips.some((c) => c.kind === 'OBJECT' && SUB_RESOLUTION.test(c.text))
 
   const corpus = useMemo(() => searchCorpus(aoi), [aoi])
+  const queryKey = normQuery(text)
+  const stored = semIndex?.queries?.[queryKey]?.results
+  const unknownQuery = submitted && !similarTo && !!semIndex && !stored
+  const waitingIndex = submitted && !similarTo && !semIndex && !semError
   const results = useMemo(() => {
     if (!submitted) return []
-    return corpus
-      .filter((t) => sensor === 'Any' || t.sensor.startsWith(sensor))
-      .filter((t) => t.cloud <= maxCloud)
-      .map((t) => ({ ...t, score: score(t, chips, similarTo) }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 12)
-  }, [corpus, chips, submitted, similarTo, sensor, maxCloud])
+    // "Find more like this" stays on the mock corpus. It is not a CLOSP search.
+    if (similarTo) {
+      return corpus
+        .filter((t) => sensor === 'Any' || t.sensor.startsWith(sensor))
+        .filter((t) => t.cloud <= maxCloud)
+        .map((t) => ({ ...t, score: score(t, chips, similarTo) }))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 12)
+    }
+    if (!stored) return []
+    return stored.filter((t) => (
+      (aoi === 'ALL' || t.aoi === aoi)
+      && (sensor === 'Any' || t.sensor.startsWith(sensor))
+      && t.cloud <= maxCloud
+    ))
+  }, [corpus, chips, submitted, similarTo, sensor, maxCloud, stored, aoi])
   const shown = [...detectorHits, ...results]
   const total = aoi === 'ALL' ? 78100 : aoiById(aoi).tiles
 
@@ -371,7 +420,7 @@ export default function Ask() {
             <div className="flex items-center gap-3 px-4 h-11 shrink-0">
               <SectionHead
                 className="flex-1"
-                title={similarTo ? `Re-ranked · more like ${similarTo}` : `${shown.length} ranked tiles`}
+                title={similarTo ? `Re-ranked · more like ${similarTo}` : unknownQuery ? 'Query not in the precomputed set' : waitingIndex ? 'Loading precomputed index' : `${shown.length} ranked tiles`}
                 right={
                   <div className="flex items-center gap-2">
                     {similarTo && <Btn size="sm" variant="ghost" onClick={() => setSimilarTo(null)}>Clear similarity</Btn>}
@@ -404,22 +453,43 @@ export default function Ask() {
               </div>
             )}
             <div className="flex-1 overflow-auto px-4 pb-4">
-              <div className="grid grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-3">
-                {shown.map((t, i) => (
-                  <ResultTile
-                    key={t.id}
-                    t={t}
-                    rank={i + 1}
-                    selected={selected === t.id}
-                    onSelect={setSelected}
-                    onMore={more}
-                    marking={marking}
-                    marked={marked.includes(t.id)}
-                    onMark={(id) => setMarked((m) => (m.includes(id) ? m.filter((x) => x !== id) : m.length < 5 ? [...m, id] : m))}
-                    similarMode={!!similarTo}
-                  />
-                ))}
-              </div>
+              {semError && (
+                <div className="mb-3 text-sm text-amber">Semantic index failed to load ({semError}).</div>
+              )}
+              {unknownQuery && (
+                <div className="panel p-4 max-w-3xl">
+                  <div className="text-sm text-fg">Only these four queries are in this precomputed set.</div>
+                  <div className="flex flex-wrap gap-2 mt-3">
+                    {EXAMPLES.map((e) => (
+                      <button key={e} onClick={() => run(e)} className="h-8 px-3 border border-ink-500 text-sm text-fg-muted hover:text-fg hover:border-fg-muted bg-ink-900">
+                        {e}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {waitingIndex && <div className="text-sm text-fg-muted">Loading precomputed index…</div>}
+              {!unknownQuery && !waitingIndex && shown.length === 0 && submitted && (
+                <div className="text-sm text-fg-muted">No chips match the current AOI, sensor, or cloud filter.</div>
+              )}
+              {!unknownQuery && (
+                <div className="grid grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-3">
+                  {shown.map((t, i) => (
+                    <ResultTile
+                      key={t.id}
+                      t={t}
+                      rank={i + 1}
+                      selected={selected === t.id}
+                      onSelect={setSelected}
+                      onMore={more}
+                      marking={marking}
+                      marked={marked.includes(t.id)}
+                      onMark={(id) => setMarked((m) => (m.includes(id) ? m.filter((x) => x !== id) : m.length < 5 ? [...m, id] : m))}
+                      similarMode={!!similarTo}
+                    />
+                  ))}
+                </div>
+              )}
             </div>
           </div>
 
@@ -433,16 +503,24 @@ export default function Ask() {
             <div className="border-t border-ink-600 p-3 shrink-0 h-[196px]">
               {sel ? (
                 <div className="flex gap-3 h-full">
-                  <SceneChip seed={sel.seed} terrain={sel.terrain} change={sel.render} sensor={sel.sensor === 'S1 SAR' ? 'sar' : 'optical'} size={256} lat={sel.lat} lon={sel.lon} box className="w-[170px] h-[170px] border border-ink-600 shrink-0" />
+                  <ChipFace t={sel} className="w-[170px] h-[170px] border border-ink-600 shrink-0" />
                   <div className="min-w-0 flex-1 space-y-1.5">
                     <MonoId>{sel.id}</MonoId>
                     <Coord lat={sel.lat} lon={sel.lon} className="block text-fg-muted" />
-                    <div className="space-y-1 pt-1">
-                      <Meter label="Terrain" value={sel.context.terrain} tone="bg-teal" />
-                      <Meter label="Elevation" value={sel.context.elevation} tone="bg-teal" />
-                      <Meter label="Road prox." value={sel.context.road} tone="bg-teal" />
-                      <Meter label="Past activity" value={sel.context.activity} tone="bg-teal" />
-                    </div>
+                    {sel.context ? (
+                      <div className="space-y-1 pt-1">
+                        <Meter label="Terrain" value={sel.context.terrain} tone="bg-teal" />
+                        <Meter label="Elevation" value={sel.context.elevation} tone="bg-teal" />
+                        <Meter label="Road prox." value={sel.context.road} tone="bg-teal" />
+                        <Meter label="Past activity" value={sel.context.activity} tone="bg-teal" />
+                      </div>
+                    ) : (
+                      <div className="space-y-1 pt-1 text-2xs text-fg-muted">
+                        <div>{sel.date} · <span className={sel.sensor === 'S1 SAR' ? 'text-sar' : ''}>{sel.sensor}</span></div>
+                        <div className="mono">score {sel.score.toFixed(2)}{sel.clip != null ? ` · clip ${Number(sel.clip).toFixed(2)}` : ''}</div>
+                        {sel.scene && <div className="mono truncate" title={sel.scene}>{sel.scene}</div>}
+                      </div>
+                    )}
                     <div className="flex gap-2 pt-1">
                       <Btn size="sm" icon="sparkle" onClick={() => more(sel.id)}>More like this <Kbd>F</Kbd></Btn>
                       <Btn size="sm" variant="ghost" onClick={() => nav('/review')}>Queue</Btn>
